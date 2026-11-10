@@ -1,0 +1,226 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Versi Godot untuk build. Harus ada di https://github.com/godotengine/godot-builds/releases (minimal 4.6).
+  GODOT_VERSION: "4.6.2"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Proyek boleh diunggah sebagai satu file .zip (paling mudah dari ponsel); zip dibuka otomatis.
+      - name: Locate project (unzip if needed)
+        run: |
+          if [ -f project.godot ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+          else
+            Z=$(ls ./*.zip 2>/dev/null | head -n1 || true)
+            if [ -z "$Z" ]; then echo "::error::project.godot not found and no .zip in the repo root"; exit 1; fi
+            rm -rf _proj && mkdir _proj && unzip -q -o "$Z" -d _proj
+            PG=$(find _proj -name project.godot -not -path '*/.godot/*' | head -n1)
+            if [ -z "$PG" ]; then echo "::error::project.godot not found inside $Z"; exit 1; fi
+            echo "PROJECT_DIR=$(dirname "$PG")" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools build-tools;35.0.1 platforms;android-35 cmake;3.10.2.4988404"
+
+      - name: Extra SDK versions (optional)
+        run: |
+          yes | sdkmanager "build-tools;36.0.0" "platforms;android-36" || true
+
+      - name: Install Godot and Android export templates
+        run: |
+          VER="${GODOT_VERSION}-stable"
+          BASE="https://github.com/godotengine/godot-builds/releases/download/${VER}"
+          echo "Downloading from $BASE"
+          curl -fL --retry 3 -o godot.zip "$BASE/Godot_v${VER}_linux.x86_64.zip" || { echo "::error::Godot ${VER} download failed (check GODOT_VERSION)"; exit 1; }
+          curl -fL --retry 3 -o templates.tpz "$BASE/Godot_v${VER}_export_templates.tpz" || { echo "::error::Export templates ${VER} download failed"; exit 1; }
+          unzip -q godot.zip
+          sudo mv "Godot_v${VER}_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          TPL="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.stable"
+          mkdir -p "$TPL" tpl
+          # templates.tpz berukuran ~1.3 GB; cukup ambil template Android
+          unzip -q templates.tpz "templates/android_*" "templates/version.txt" -d tpl || unzip -q templates.tpz -d tpl
+          mv tpl/templates/* "$TPL/"
+          rm -rf tpl templates.tpz godot.zip
+          ls -la "$TPL"
+          godot --version
+
+      - name: Godot editor settings (SDK + JDK paths)
+        run: |
+          mkdir -p "$HOME/.config/godot"
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          for f in editor_settings-4.tres editor_settings-4.6.tres editor_settings-4.7.tres; do
+            printf '[gd_resource type="EditorSettings" format=3]\n\n[resource]\nexport/android/android_sdk_path = "%s"\nexport/android/java_sdk_path = "%s"\n' "$SDK" "$JAVA_HOME" > "$HOME/.config/godot/$f"
+          done
+          echo "SDK=$SDK  JAVA_HOME=$JAVA_HOME"
+          ls "$SDK" "$SDK/build-tools" || true
+
+      # Kunci penandatangan disimpan di cache supaya APK berikutnya bisa meng-update yang lama
+      # (tanpa uninstall, jadi lagu & progres tetap aman).
+      - name: Restore signing key cache
+        uses: actions/cache@v4
+        with:
+          path: ~/beatdrop.keystore
+          key: beatdrop-keystore-v1
+
+      - name: Create signing key (first run only)
+        run: |
+          if [ ! -f "$HOME/beatdrop.keystore" ]; then
+            keytool -genkeypair -v -keystore "$HOME/beatdrop.keystore" -alias beatdrop \
+              -keyalg RSA -keysize 2048 -validity 36500 \
+              -storepass beatdrop123 -keypass beatdrop123 \
+              -dname "CN=BeatDrop, OU=Game, O=BeatDrop, L=ID, C=ID"
+          fi
+
+      # Versi game naik otomatis di setiap build: MAJOR.MINOR dari file VERSION + nomor build GitHub.
+      - name: Set version (auto-bump per build)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          BASE=$(tr -d '[:space:]' < VERSION 2>/dev/null || true)
+          BASE=${BASE:-1.0}
+          RUN=${{ github.run_number }}
+          VERSION="${BASE}.${RUN}"
+          sed -i "s|^config/version=.*|config/version=\"${VERSION}\"|" project.godot
+          sed -i "s|^version/name=.*|version/name=\"${VERSION}\"|; s|^version/code=.*|version/code=${RUN}|" export_presets.cfg
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "### BeatDrop v${VERSION} (versionCode ${RUN})" >> "$GITHUB_STEP_SUMMARY"
+          grep -n "config/version" project.godot
+          grep -n "^version/" export_presets.cfg
+
+      - name: Import project
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          mkdir -p build
+          godot --headless --path . --import 2>&1 | tee "$RUNNER_TEMP/import.log" || true
+          godot --headless --path . --import 2>&1 | tee -a "$RUNNER_TEMP/import.log" || true
+
+      # ---- Diagnostik (Godot sungguhan, headless) ----
+      # 1) Jalankan game headless beberapa frame. Bila ada error skrip, build DIHENTIKAN (tidak membuat APK rusak).
+      - name: Check - game boots headless (script errors)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          timeout 120 godot --headless --path . --quit-after 300 > "$RUNNER_TEMP/boot.log" 2>&1 || true
+          PAT="SCRIPT ERROR|Parse Error|Compile Error|Failed to load script|Could not (preload|parse)"
+          {
+            echo "### Boot check"
+            if grep -qE "$PAT" "$RUNNER_TEMP/boot.log"; then
+              echo "**Script errors found - APK build stopped:**"; echo '```'
+              grep -nE -B1 -A3 "$PAT" "$RUNNER_TEMP/boot.log" | head -80
+              echo '```'
+            else
+              echo "No script errors while booting the game."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          ! grep -qE "$PAT" "$RUNNER_TEMP/boot.log"
+
+      # 2) Uji UI: kunjungi semua layar + gameplay singkat. Berhenti hanya bila ada error di skrip game.
+      - name: Check - UI smoke test (all screens + short gameplay)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          timeout 300 godot --headless --path . tools/uitest.tscn > "$RUNNER_TEMP/uitest.log" 2>&1 || true
+          PAT="SCRIPT ERROR|Parse Error|Compile Error|Failed to load script"
+          BAD=0
+          if grep -E -A4 "$PAT" "$RUNNER_TEMP/uitest.log" | grep -q "res://scripts/"; then BAD=1; fi
+          {
+            echo "### UI smoke test"
+            echo '```'
+            grep -nE "UITEST|$PAT" "$RUNNER_TEMP/uitest.log" | head -60
+            echo '```'
+            if [ "$BAD" = "1" ]; then
+              echo "**Errors in game scripts - APK build stopped:**"; echo '```'
+              grep -nE -B1 -A5 "$PAT" "$RUNNER_TEMP/uitest.log" | head -100
+              echo '```'
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$BAD" = "0"
+
+      - name: Check - audio analyzer self-test
+        continue-on-error: true
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          timeout 600 godot --headless --path . tools/selftest.tscn > "$RUNNER_TEMP/selftest.log" 2>&1 || true
+          {
+            echo "### Analyzer self-test"; echo '```'
+            grep -nE "SELFTEST|SCRIPT ERROR|Parse Error|ERROR" "$RUNNER_TEMP/selftest.log" | head -60
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          grep -q "SELFTEST OK" "$RUNNER_TEMP/selftest.log"
+
+      - name: Export APK (release template)
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          GODOT_ANDROID_KEYSTORE_RELEASE_USER: beatdrop
+          GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD: beatdrop123
+        run: |
+          export GODOT_ANDROID_KEYSTORE_RELEASE_PATH="$HOME/beatdrop.keystore"
+          mkdir -p build
+          godot --headless --path . --export-release "Android" build/BeatDrop.apk 2>&1 | tee "$RUNNER_TEMP/export.log"
+          ls -la build
+
+      - name: Verify APK exists
+        run: |
+          test -s "${PROJECT_DIR}/build/BeatDrop.apk" || { echo "::error::BeatDrop.apk was not produced - see export log"; exit 1; }
+          cp "${PROJECT_DIR}/build/BeatDrop.apk" "${PROJECT_DIR}/build/BeatDrop-v${VERSION}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BeatDrop-v${{ env.VERSION }}
+          path: ${{ env.PROJECT_DIR }}/build/BeatDrop-v${{ env.VERSION }}.apk
+
+      # Setiap build membuat rilis baru "vX.Y.N" di halaman Releases (yang terbaru otomatis jadi "Latest").
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        continue-on-error: true
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: BeatDrop v${{ env.VERSION }}
+          body: "APK build otomatis versi ${{ env.VERSION }}. Unduh file .apk lalu install (menimpa versi lama, data tetap aman)."
+          make_latest: "true"
+          files: ${{ env.PROJECT_DIR }}/build/BeatDrop-v${{ env.VERSION }}.apk
+
+      # Bila ada langkah yang gagal: tampilkan baris error terakhir di ringkasan run (mudah dibaca dari ponsel).
+      - name: Error summary
+        if: failure()
+        run: |
+          {
+            echo "## Build failed - last log lines"
+            for f in export import boot uitest; do
+              if [ -f "$RUNNER_TEMP/$f.log" ]; then
+                echo "### $f.log"; echo '```'; tail -n 60 "$RUNNER_TEMP/$f.log"; echo '```'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/*.log
+          if-no-files-found: ignore
+          
